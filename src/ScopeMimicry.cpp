@@ -1,3 +1,12 @@
+/**
+ * @file
+ * @brief ScopeMimicry: mimic a digital scope inside the cpu with a ram array.
+ * 
+ * @author Régis Ruelland <regis.ruelland@laas.fr>
+ * @author Jean Alinei <jean.alinei@laas.fr>
+ * @author Pierre Haessig <pierre.haessig@centralesupelec.fr>
+ */
+
 #include "ScopeMimicry.h"
 #include <stdio.h>
 #include <string.h>
@@ -5,14 +14,15 @@
 ScopeMimicry::ScopeMimicry(uint16_t length, uint16_t nb_channel):
     _length(length),
     _nb_channel(nb_channel),
-    _acq_counter(0),
-    _effective_chan_number(0),
-    _old_trigg_value(false),
-    _trigged(false),
-    _delay(0),
-    _delay_complement(length),
-    _trigged_counter(length),
-    _final_idx(length-1)
+    _nb_channel_effective(0),
+    /* Variables for acquisition logic */
+    _nb_pretrig(0),
+    _acq_state(ACQ_UNTRIG),
+    _acq_count(0),
+    _mem_idx(0),
+    _trig_idx(0),
+    _final_idx(length-1),
+    _triggFunc(NULL)
 {
     _memory = new float[_length*_nb_channel]();
     _names = new const char*[nb_channel];
@@ -22,88 +32,110 @@ ScopeMimicry::ScopeMimicry(uint16_t length, uint16_t nb_channel):
 ScopeMimicry::~ScopeMimicry() {
     delete(_memory);
     delete(_names);
+    // missing delete _channels?
 }
 
-/**
- * @brief it get the reference of a static variable (channel) to be able to record its values when
- * it is necessary.
- *
- * @param channel : reference to a static variable
- * @param name: name of the variable you want to have after retrieving.
- */
-void ScopeMimicry::connectChannel(float &channel, const char name[]) {
-    if (_effective_chan_number < _nb_channel) {
+bool ScopeMimicry::connectChannel(float &channel, const char name[]) {
+    if (_nb_channel_effective < _nb_channel) {
         // capture the reference of the variable.
-        _channels[_effective_chan_number] = &channel;
-        _names[_effective_chan_number] = name;
-        _effective_chan_number++;
-    }
-    // TODO: return errno code ?
-}
-
-/**
- * @brief add one value of each channel into its internal memory if the trigger has been
- * activated
- */
-uint16_t ScopeMimicry::acquire() {
-    bool trigg_value = (*_triggFunc)();
-    // compute trigger
-    if (!_old_trigg_value && trigg_value && !_trigged) {
-        _trigged = true;
-        _trigged_counter = (_acq_counter + _delay_complement - 1) % _length;
-    }
-    _old_trigg_value = trigg_value;
-
-    if (!_trigged) {
-        _trigged_counter = -1;
-    }
-    if (_acq_counter != _trigged_counter) {
-        _acq_counter = (_acq_counter + 1)% _length;
-        for (int k_ch=0; k_ch < _effective_chan_number; k_ch++) {
-            _memory[(_acq_counter * _nb_channel) + k_ch] = *(_channels[k_ch]);
-        }
-        if (_trigged)
-            return 1;
-        else
-            return 0;
+        _channels[_nb_channel_effective] = &channel;
+        _names[_nb_channel_effective] = name;
+        _nb_channel_effective++;
+        return true;
     } else {
-        _final_idx = _acq_counter;
-        return 2;
+        return false;
     }
 }
 
-/**
- * @brief define a delay to record data before the trigg. delay is in [0, 1]
- *
- * @param d delay
- */
-void ScopeMimicry::set_delay(float32_t d) {
-    if (d < 0.0) _delay = 0.0;
-    else if (d >= 1.0) _delay = _length;
-    else _delay = d *_length;
-    _delay_complement = _length - _delay;
+ScopeAcqState ScopeMimicry::acquire() {
+    // Call trigger function if set, else trigger always true
+    bool trigg_value;
+    if (_triggFunc != NULL) {
+        trigg_value = (*_triggFunc)();
+    } else {
+        trigg_value = true;
+    }
+    // Aquisition status state machine, state change logic:
+    if (_acq_state == ACQ_UNTRIG) {
+        if (trigg_value) {
+            // State change: ACQ_UNTRIG -> ACQ_TRIG
+            _acq_state = ACQ_TRIG;
+            // ACQ_UNTRIG exit actions: keep at most nb_pretrig samples + save trigger instant
+            _acq_count = (_acq_count<_nb_pretrig) ? _acq_count : _nb_pretrig; //min(_acq_count, _nb_pretrig), i.e. keep at most _nb_pretrig samples before trigger
+            _trig_idx = _mem_idx;
+        }
+    }
+    if (_acq_state == ACQ_TRIG) { // including the case if status was changed just before
+        if (_acq_count == _length) {
+            _acq_state = ACQ_DONE;
+            // ACQ_TRIG exit action: save last record index
+            _final_idx = (_mem_idx + _length - 1) % _length; // (idx - 1) % _length breaks with unsigned int16 when idx=0
+        }
+
+    }
+    // Remark: ACQ_DONE state can only be left by calling start()
+
+    // State machin actions:
+    if (_acq_state == ACQ_DONE) {
+        return _acq_state;
+
+    } else { // _acq_state == ACQ_UNTRIG or ACQ_TRIG, i.e. data being recorded
+        // Record channel values at _mem_idx*_nb_channel index
+        for (int k_ch=0; k_ch < _nb_channel; k_ch++) {
+            int16_t mem_idx_effective = _mem_idx * _nb_channel;
+            if (k_ch < _nb_channel_effective) {
+                _memory[mem_idx_effective + k_ch] = *(_channels[k_ch]);
+            } else {
+                _memory[mem_idx_effective + k_ch] = 0.0/0.0; // NaN
+            }
+        }
+        // Increment memory index and acquisition counter
+        _mem_idx = (_mem_idx + 1) % _length;
+        _acq_count = (_acq_count+1 < _length) ? _acq_count+1 : _length; //min(_acq_count+1, _length)
+    }
+    return _acq_state;
 }
 
-/**
- * @brief reset the trigger and enable to record new data_dumped
- */
+uint16_t ScopeMimicry::get_pretrig_nsamples() {
+    return _nb_pretrig;
+}
+
+void ScopeMimicry::set_pretrig_nsamples(uint16_t n) {
+    if (n < 0) _nb_pretrig = 0;
+    else if (n > _length) _nb_pretrig = _length;
+    else _nb_pretrig = n;
+}
+
+void ScopeMimicry::set_pretrig_ratio(float r) {
+    if (r < 0.0) _nb_pretrig = 0;
+    else if (r >= 1.0) _nb_pretrig = _length;
+    else _nb_pretrig = r *_length;
+}
+
 void ScopeMimicry::start() {
-    _trigged = false;
-    _old_trigg_value = false;
+    _acq_state = ACQ_UNTRIG;
+    _acq_count = 0;
+    _mem_idx = 0;
+}
+
+void ScopeMimicry::set_trigger(bool (*func)()) {
+    _triggFunc = func;
+}
+
+bool ScopeMimicry::has_trigged() {
+    return _acq_state == ACQ_TRIG || _acq_state == ACQ_DONE;
+}
+
+ScopeAcqState ScopeMimicry::acq_state() {
+    return _acq_state;
 }
 
 uint16_t ScopeMimicry::get_final_idx() {
     return _final_idx;
 }
 
-/**
- * @brief get a function without arguments which should return a boolean to enable
- * recording
- *
- * @param func: handle to a function which shall return a boolean.
- */
-void ScopeMimicry::set_trigger(bool (*func)()) {
-    _triggFunc = func;
+uint16_t ScopeMimicry::get_trig_idx() {
+    return _trig_idx;
 }
 
 uint8_t * ScopeMimicry::get_buffer() {
@@ -122,13 +154,8 @@ uint16_t ScopeMimicry::get_nb_channel() {
     return _nb_channel;
 }
 
-bool ScopeMimicry::has_trigged() {
-    return _trigged;
-}
-
-uint16_t ScopeMimicry::status() {
-    return (uint16_t)((_trigged_counter*100) / _delay_complement);
-
+uint16_t ScopeMimicry::get_nb_channel_effective() {
+    return _nb_channel_effective;
 }
 
 const char *ScopeMimicry::get_channel_name(uint16_t idx) {
@@ -140,13 +167,6 @@ const char *ScopeMimicry::get_channel_name(uint16_t idx) {
     }
 }
 
-/**
- * @brief get one value of one channel
- *
- * @param index : value in the table between [0, length-1]
- * @param channel_idx :channel number.
- * @return float value.
- */
 float32_t ScopeMimicry::get_channel_value(uint32_t index, uint32_t channel_idx) {
     /* to be sure we are not outside the buffer */
     index = (index) % _length;
@@ -161,8 +181,7 @@ enum e_dump_state ScopeMimicry::get_dump_state() {
 	return dump_state;
 }
 
-char* ScopeMimicry::dump_datas()
-{
+char* ScopeMimicry::dump_datas() {
 	uint16_t n_datas = _length * _nb_channel;
 	/* reset char_name */
 	char_name[0] = '\0';
@@ -193,15 +212,15 @@ char* ScopeMimicry::dump_datas()
 			dump_state = datas;
 		break;
 		case datas:
-			if (_idx_datas < n_datas-1)
+			if (_idx_datas <= n_datas-1)
 			{
 				sprintf(char_data, "%08x\n", *((uint32_t *) _memory + _idx_datas));
 				data_dumped = char_data;
-				_idx_datas += 1;
-			}
-			else
-			{
-				dump_state = finished;
+                if (_idx_datas < n_datas-1) {
+                    _idx_datas += 1;
+                } else { // _idx_datas == n_datas-1
+                    dump_state = finished;
+                }
 			}
 		break;
 		case finished:
